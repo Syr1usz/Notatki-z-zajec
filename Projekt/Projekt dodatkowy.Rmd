@@ -1,0 +1,287 @@
+---
+title: "Zaawansowana Analiza Przemówień"
+output: 
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    theme: cosmo
+runtime: shiny
+---
+
+```{r setup, include=FALSE}
+# Wymagane pakiety ----
+library(flexdashboard)
+library(shiny)
+library(tidyverse)
+library(tidytext)
+library(plotly)
+library(DT)
+library(visNetwork)
+library(SnowballC)  # Pakiet do stemmingu (rdzeniowania słów)
+library(tm)         # Przetwarzanie tekstu z zajęć (removeNumbers, stopwords)
+library(ggthemes)   # Dodatkowe motywy wykresów (np. theme_bw)
+
+bing_lexicon <- get_sentiments("bing")
+
+# Globalna paleta kolorów dla wykresów
+kolory_wykresow <- c("#1f77b4", "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b")
+```
+
+# Opcje i Wgrywanie {.sidebar}
+
+### Zarządzanie plikami
+
+Wgraj transkrypcje przemówień (pliki .txt).
+
+```{r}
+fileInput("plik_danych", "Wybierz pliki (.txt)", 
+          accept = c(".txt", "text/plain"),
+          multiple = TRUE)
+
+hr()
+
+radioButtons("tryb_grafu", "Wyświetlanie Grafu Sieciowego:",
+             choices = c("Jeden wspólny graf (z kolorami)" = "wspolny",
+                         "Osobne grafy dla plików" = "osobne"))
+
+hr()
+helpText("System przed analizą automatycznie ujednolica apostrofy, usuwa tzw. stop words i wykonuje stemming (sprowadza wyrazy do rdzenia), by precyzyjnie wyliczyć wagę TF-IDF.")
+```
+
+```{r}
+# --- LOGIKA REAKTYWNA ---
+
+# 1. Funkcja do wczytywania i wstępnego przetwarzania tekstu (Text Preprocessing)
+dane_tekstowe <- reactive({
+  validate(need(input$plik_danych, "Proszę wgrać co najmniej jeden plik .txt, aby rozpocząć analizę."))
+  
+  df_list <- lapply(1:nrow(input$plik_danych), function(i) {
+    sciezka <- input$plik_danych$datapath[i]
+    nazwa_pliku <- input$plik_danych$name[i]
+    
+    # Wczytanie tekstu z pliku
+    text <- tolower(readLines(sciezka, encoding = "UTF-8", warn = FALSE))
+    
+    # Zamiana wszystkich rodzajów apostrofów na klasyczny '
+    text <- gsub("[\u2019\u2018\u0060\u00B4]", "'", text)
+    
+    # Usunięcie cyfr (interpunkcja za chwilę)
+    text <- removeNumbers(text)
+    
+    caly_tekst <- paste(text, collapse = " ")
+    
+    data.frame(dokument = nazwa_pliku, tekst = caly_tekst, stringsAsFactors = FALSE)
+  })
+  
+  bind_rows(df_list)
+})
+
+# 2. Tokeny ze Stemmingiem (do TF-IDF i Bigramów) i Bez (do Sentymentu)
+tokeny_podstawowe <- reactive({
+  
+  # Przygotowanie i usuniecie stopwords (jednolite apostrofy)
+  # stopwords z pakietu tidytext 
+  tidy_stopwords <- tolower(stop_words$word)
+  tidy_stopwords <- gsub("[\u2019\u2018\u0060\u00B4]", "'", tidy_stopwords)
+  
+  # stopwords z pakietu tm
+  tm_stopwords <- tolower(stopwords("en"))
+  tm_stopwords <- gsub("[\u2019\u2018\u0060\u00B4]", "'", tm_stopwords)
+  
+  dane_tekstowe() %>%
+    unnest_tokens(word, tekst) %>%
+    # Usunięcie słów zawierających apostrof (czyli skróty typu I'm, I've, don't)
+    filter(!str_detect(word, "'")) %>%
+    # Usunięcie interpunkcji PRZED porównaniem do stopwords
+    mutate(word = str_replace_all(word, "[[:punct:]]", "")) %>%
+    filter(word != "") %>%
+    # Usunięcie spacji z początka i końca słów
+    mutate(word = str_trim(word)) %>%
+    # Usuniecie stopwords docelowych
+    filter(!(word %in% tidy_stopwords)) %>%
+    filter(!(word %in% tm_stopwords))
+})
+
+# 3. TF-IDF (Z zastosowaniem stemmingu)
+tfidf <- reactive({
+  tokeny_podstawowe() %>%
+    # Stemming z użyciem funkcji z pakietu tm/SnowballC
+    mutate(word = stemDocument(word)) %>%
+    count(dokument, word) %>%
+    bind_tf_idf(word, dokument, n) %>%
+    arrange(desc(tf_idf))
+})
+
+# 4. Łuk Narracyjny w czasie 
+sentyment_narracji <- reactive({
+  dane_tekstowe() %>%
+    unnest_tokens(word, tekst) %>%
+    group_by(dokument) %>%
+    mutate(
+      pozycja = row_number(),
+      etap = ntile(pozycja, 20) 
+    ) %>%
+    # Analiza sentymentu przy użyciu słownika Bing
+    inner_join(bing_lexicon, by = "word") %>%
+    count(dokument, etap, sentiment) %>%
+    pivot_wider(names_from = sentiment, values_from = n, values_fill = list(n = 0)) %>%
+    mutate(net_sentiment = positive - negative)
+})
+
+# 5. Bigramy (Zastosowany stemming)
+bigramy_grupowane <- reactive({
+  
+  tidy_stopwords <- tolower(stop_words$word)
+  tm_stopwords <- tolower(stopwords("en"))
+  
+  dane_tekstowe() %>%
+    unnest_tokens(bigram, tekst, token = "ngrams", n = 2) %>%
+    separate(bigram, c("word1", "word2"), sep = " ") %>%
+    filter(!(word1 %in% tidy_stopwords), !(word2 %in% tidy_stopwords)) %>%
+    filter(!(word1 %in% tm_stopwords), !(word2 %in% tm_stopwords)) %>%
+    filter(!str_detect(word1, "'"), !str_detect(word2, "'")) %>%
+    mutate(word1 = str_replace_all(word1, "[[:punct:]]", ""),
+           word2 = str_replace_all(word2, "[[:punct:]]", "")) %>%
+    filter(word1 != "", word2 != "") %>%
+    mutate(word1 = stemDocument(word1),
+           word2 = stemDocument(word2)) %>%
+    count(dokument, word1, word2)
+})
+```
+
+# Struktura i Emocje {data-icon="fa-project-diagram"}
+
+Row {data-height=500}
+-----------------------------------------------------------------------
+
+### Sieć Powiązań Słów (Bigramy)
+
+```{r}
+uiOutput("dynamiczny_graf")
+
+output$dynamiczny_graf <- renderUI({
+  req(dane_tekstowe())
+  
+  if (input$tryb_grafu == "wspolny") {
+    visNetworkOutput("graf_wspolny", height = "400px")
+  } else {
+    docs <- unique(dane_tekstowe()$dokument)
+    szerokosc <- floor(100 / length(docs))
+    
+    # Tworzenie dynamicznych okien dla osobnych grafów
+    lista_wykresow <- lapply(1:length(docs), function(i) {
+      tags$div(style = paste0("width: ", szerokosc, "%; float: left; padding-right: 10px; box-sizing: border-box;"),
+               h5(docs[i], align = "center"),
+               visNetworkOutput(paste0("graf_osobny_", i), height = "350px")
+      )
+    })
+    do.call(tagList, lista_wykresow)
+  }
+})
+
+observe({
+  req(bigramy_grupowane())
+  docs <- unique(dane_tekstowe()$dokument)
+  kolory_doc <- kolory_wykresow[1:length(docs)]
+  names(kolory_doc) <- docs
+  
+  # RENDER: GRAF WSPÓLNY
+  output$graf_wspolny <- renderVisNetwork({
+    edges <- bigramy_grupowane() %>%
+      group_by(word1, word2) %>%
+      mutate(suma_powiazan = sum(n)) %>%
+      slice_max(n, n = 1, with_ties = FALSE) %>% # Wskazuje z jakiego pliku połączanie pochodzi najczęściej
+      ungroup() %>%
+      arrange(desc(suma_powiazan)) %>%
+      head(60) %>%
+      rename(from = word1, to = word2, value = suma_powiazan) %>%
+      mutate(color = kolory_doc[dokument]) # Pokolorowanie krawędzi wg dokumentu
+    
+    nodes <- data.frame(id = unique(c(edges$from, edges$to))) %>%
+      mutate(label = id, font.size = 20, color = "lightgray")
+    
+    legenda_krawedzie <- data.frame(
+      label = names(kolory_doc), color = unname(kolory_doc), arrows = "to", font.align = "top"
+    )
+    
+    visNetwork(nodes, edges) %>%
+      visEdges(arrows = "to") %>%
+      visOptions(highlightNearest = TRUE, nodesIdSelection = TRUE) %>%
+      visPhysics(solver = "forceAtlas2Based", forceAtlas2Based = list(gravitationalConstant = -50)) %>%
+      visLegend(addEdges = legenda_krawedzie, useGroups = FALSE)
+  })
+  
+  # RENDER: GRAFY OSOBNE
+  for (i in 1:length(docs)) {
+    local({
+      moje_i <- i
+      moj_doc <- docs[moje_i]
+      kolor_bazowy <- kolory_doc[moj_doc]
+      
+      output[[paste0("graf_osobny_", moje_i)]] <- renderVisNetwork({
+        edges_sep <- bigramy_grupowane() %>% 
+          filter(dokument == moj_doc) %>%
+          arrange(desc(n)) %>% 
+          head(40) %>%
+          rename(from = word1, to = word2, value = n) %>%
+          mutate(color = kolor_bazowy)
+        
+        nodes_sep <- data.frame(id = unique(c(edges_sep$from, edges_sep$to))) %>%
+          mutate(label = id, font.size = 18, color = "lightgray")
+        
+        visNetwork(nodes_sep, edges_sep) %>%
+          visEdges(arrows = "to") %>%
+          visOptions(highlightNearest = TRUE) %>%
+          visPhysics(solver = "forceAtlas2Based")
+      })
+    })
+  }
+})
+```
+
+Row {data-height=500}
+-----------------------------------------------------------------------
+
+### Wykresy przedstawiające ewolucję sentymentu w czasie
+
+```{r}
+renderPlotly({
+  validate(need(nrow(sentyment_narracji()) > 0, "Brak słów nacechowanych emocjonalnie w tekście."))
+  
+  # Zachowanie tych samych kolorów co na grafie
+  docs <- unique(dane_tekstowe()$dokument)
+  kolory_doc <- kolory_wykresow[1:length(docs)]
+  
+  p <- ggplot(sentyment_narracji(), aes(x = etap, y = net_sentiment, color = dokument)) +
+    geom_smooth(se = FALSE, method = "loess", span = 0.4, linewidth = 1.2) +
+    geom_point(alpha = 0.5) +
+    geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+    scale_color_manual(values = kolory_doc) +
+    labs(x = "Etap przemówienia (podział na 20 segmentów)", 
+         y = "Sentyment Netto (Pozytywy vs Negatywy)",
+         color = "Przemówienie") +
+    theme_bw() + 
+    ggtitle("Zmiana sentymentu w czasie")
+  
+  ggplotly(p)
+})
+```
+
+# Unikalność (TF-IDF) {data-icon="fa-table"}
+
+Row
+-----------------------------------------------------------------------
+
+### Specyficzne Hasła Przemówień (Wskaźnik TF-IDF - wyrazy poddane stemmingowi)
+
+```{r}
+renderDT({
+  validate(need(length(unique(tfidf()$dokument)) > 1, "Wskazówka: TF-IDF pokazuje unikalność względem innych tekstów. Wgraj co najmniej 2 pliki, by zobaczyć różnice."))
+  
+  datatable(tfidf() %>% mutate(across(is.numeric, round, 4)), 
+            options = list(pageLength = 15, autoWidth = TRUE),
+            rownames = FALSE,
+            colnames = c("Plik (Przemówienie)", "Rdzeń Słowa", "TF (Częstość)", "IDF", "Waga TF-IDF")) %>%
+    formatStyle('tf_idf', background = styleColorBar(range(0, max(tfidf()$tf_idf, na.rm=TRUE)), 'lightblue'), backgroundSize = '98% 88%', backgroundRepeat = 'no-repeat', backgroundPosition = 'center')
+})
+```
